@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-duckduckgo-search
+duckduckgo-search>=6.3.0
 httpx
 pydantic
