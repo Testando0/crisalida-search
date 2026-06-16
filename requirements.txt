@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+duckduckgo-search
+httpx
+pydantic
