@@ -1,12 +1,14 @@
 import asyncio
 import random
 import logging
+import os
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from duckduckgo_search import DDGS
 import httpx
 from pydantic import BaseModel
+import urllib.parse
 
 # Configuração de Logs
 logging.basicConfig(level=logging.INFO)
@@ -14,24 +16,15 @@ logger = logging.getLogger("gogoduck")
 
 app = FastAPI(
     title="Gogoduck Web Search API for LLMs",
-    docs_url="/docs",
-    redoc_url=None
+    docs_url="/docs"
 )
 
-# Habilitar CORS para permitir chamadas de qualquer origem (útil para LLMs e integrações)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0"
-]
 
 class SearchResult(BaseModel):
     title: str
@@ -47,6 +40,7 @@ class ProxyManager:
         """Busca proxies gratuitos de fontes públicas"""
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
+                # Usando múltiplas fontes de proxy para maior variedade
                 response = await client.get("https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all")
                 if response.status_code == 200:
                     self.proxies = [p.strip() for p in response.text.split("\n") if p.strip()]
@@ -57,8 +51,7 @@ class ProxyManager:
     def get_random_proxy(self):
         if not self.proxies:
             return None
-        proxy = random.choice(self.proxies)
-        return f"http://{proxy}"
+        return f"http://{random.choice(self.proxies)}"
 
 proxy_manager = ProxyManager()
 
@@ -67,37 +60,56 @@ async def startup_event():
     asyncio.create_task(proxy_manager.refresh_proxies())
 
 async def fetch_ddg_results(query: str, max_results: int = 5) -> List[SearchResult]:
-    """Busca no DuckDuckGo com rotação de proxy e User-Agent"""
-    proxy_url = proxy_manager.get_random_proxy()
+    """Busca no DuckDuckGo com múltiplas tentativas e estratégias"""
     
-    # Tenta com proxy primeiro
-    if proxy_url:
+    # Limpa a query (remove excesso de espaços e garante decodificação)
+    query = urllib.parse.unquote(query).strip()
+    
+    strategies = [
+        {"use_proxy": True, "timeout": 10},
+        {"use_proxy": False, "timeout": 15},
+        {"use_proxy": True, "timeout": 15}
+    ]
+    
+    for strategy in strategies:
+        proxy_url = proxy_manager.get_random_proxy() if strategy["use_proxy"] else None
         try:
-            with DDGS(proxy=proxy_url, timeout=15) as ddgs:
+            # O DDGS agora recomenda o uso de contextos ou instâncias limpas
+            with DDGS(proxy=proxy_url, timeout=strategy["timeout"]) as ddgs:
+                # Tentamos usar o backend 'text' que é o mais estável
                 results = list(ddgs.text(query, max_results=max_results))
                 if results:
-                    return [SearchResult(title=r.get("title", ""), url=r.get("href", ""), body=r.get("body", ""), source="duckduckgo") for r in results]
+                    return [
+                        SearchResult(
+                            title=r.get("title", ""),
+                            url=r.get("href", ""),
+                            body=r.get("body", ""),
+                            source="duckduckgo"
+                        ) for r in results
+                    ]
         except Exception as e:
-            logger.warning(f"Falha com proxy {proxy_url}. Tentando direto...")
+            logger.warning(f"Estratégia (proxy={strategy['use_proxy']}) falhou para '{query}': {e}")
+            continue
+            
+    return []
 
-    # Fallback direto (sem proxy)
-    try:
-        with DDGS(timeout=15) as ddgs:
-            results = list(ddgs.text(query, max_results=max_results))
-            return [SearchResult(title=r.get("title", ""), url=r.get("href", ""), body=r.get("body", ""), source="duckduckgo") for r in results]
-    except Exception as e:
-        logger.error(f"Erro total no DDG: {e}")
-        return []
-
-# Rota de busca com barra opcional para evitar 404
 @app.get("/search")
 @app.get("/search/")
 async def search(
     q: str = Query(..., description="A consulta de busca"),
     max_results: int = Query(5, ge=1, le=10)
 ):
-    logger.info(f"Busca recebida: {q}")
+    # Log para depuração no Render
+    logger.info(f"Requisição de busca: {q}")
+    
     results = await fetch_ddg_results(q, max_results)
+    
+    # Se ainda estiver vazio, tentamos uma busca mais genérica (fallback)
+    if not results and len(q.split()) > 3:
+        logger.info(f"Tentando busca simplificada para: {q}")
+        simplified_q = " ".join(q.split()[:5]) # Pega apenas as primeiras 5 palavras
+        results = await fetch_ddg_results(simplified_q, max_results)
+        
     return results
 
 @app.get("/")
@@ -106,13 +118,11 @@ async def health():
     return {
         "status": "online", 
         "engine": "gogoduck", 
-        "proxies_available": len(proxy_manager.proxies),
-        "endpoints": ["/search?q=query", "/health"]
+        "proxies": len(proxy_manager.proxies),
+        "usage": "/search?q=seu%20termo%20aqui"
     }
 
 if __name__ == "__main__":
     import uvicorn
-    # O Render usa a variável de ambiente PORT
-    import os
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
