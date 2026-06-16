@@ -1,0 +1,16 @@
+# render.yaml — deploy Crisalida Search on Render free tier
+# Docs: https://render.com/docs/render-yaml-spec
+
+services:
+  - type: web
+    name: crisalida-search
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "10000"
+    # Auto-deploy on every git push (set to true if using a repo)
+    autoDeploy: false
